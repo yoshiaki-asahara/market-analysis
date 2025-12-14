@@ -142,10 +142,12 @@ def main():
     # 検索フィルタ（ロジックで関数を入れ替える）
     filtered_tickers = search_drawdown(headers, all_tickers, lookback_days=lookback_days, threshold=threshold, top_n=top_n)
 
-    # 検索された銘柄の表示
-    code_to_name = {info["Code"]: info.get("CompanyName") for info in infos}
-    for code in filtered_tickers:
-        print(f"{code}\t{code_to_name.get(code, '')}")
+    # ティッカーと会社名のペアをファイルに保存
+    code_to_name = {info["Code"]: info.get("CompanyName") or info.get("CompanyNameEnglish") or "" for info in infos}
+    lines = [f"{code},{code_to_name.get(code, '')}" for code in filtered_tickers]
+    with open("search_result.txt", "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    display(f"Wrote {len(filtered_tickers)} ticker-name pairs to search_result.txt")
 
 if __name__ == "__main__":
     main()

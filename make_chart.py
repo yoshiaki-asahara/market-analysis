@@ -4,104 +4,118 @@ import requests
 
 from IPython.display import display
 import pandas as pd
+import re
+from pathlib import Path
+import yaml
 
 API_URL = "https://api.jquants.com"
 
-# 固定パラメータ（引数ではなくコード内に埋め込み）
-# 例: ティッカー、財務諸表の種類、期間を固定値として設定
-TICKER = "186A0"
-STATEMENT = "income_statement"  # 他の選択肢: "balance_sheet", "cash_flow"
-PERIOD = "annual"               # 他の選択肢: "quarterly"
+def debug(msg: str):
+    """シンプルなデバッグ出力（タイムスタンプ付き）"""
+    try:
+        ts = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[DEBUG {ts}] {msg}")
+    except Exception:
+        print(f"[DEBUG] {msg}")
 
-def search_drawdown(headers, tickers, top_n=20, lookback_days=252, threshold=0.3):
+def make_chart(headers, code: str, company_name: str, output_dir: Path, start_date: str | None = None, end_date: str | None = None) -> pd.DataFrame:
     """
-    価格データから最大ドローダウンが閾値以上の銘柄を抽出する。
+    価格チャート用の時系列データ（日足）を取得して整形して返す。
+
     Args:
-        headers: 認証ヘッダ（Bearer idToken）
-        tickers: ティッカーのリスト
-        top_n: 上位何件返すか
-        lookback_days: 直近何営業日で計算するか
-        threshold: 最大ドローダウンの閾値（例: 0.3=30%）
-    Returns:
-        ドローダウンが大きい順のティッカーリスト
+        headers: API 認証ヘッダ（Bearer トークン）
+        code (str): 銘柄コード
+        start_date (str | None): 開始日（YYYY-MM-DD）。未指定ならAPIデフォルト。
+        end_date (str | None): 終了日（YYYY-MM-DD）。未指定ならAPIデフォルト。
     """
-    results = []
-    for code in tickers:
-        try:
-            endpoint = f"{API_URL}/v1/prices/daily_quotes"
-            resp = requests.get(endpoint, headers=headers, params={"code": code}, timeout=30)
-            if resp.status_code != 200:
-                continue
-            payload = resp.json()
-            rows = payload.get("daily_quotes") or payload.get("data") or payload.get("results") or []
-            if not rows:
-                continue
+    debug(f"make_chart start: code={code}, company_name={company_name}, start_date={start_date}, end_date={end_date}")
+    delay_days = 12*7  # J-Quants APIのFreeプランのため12週間遅延
+    lookback_days = 180
 
-            df = pd.DataFrame(rows)
+    # 取得期間を決定
+    if start_date or end_date:
+        from_date = start_date or (pd.Timestamp.today() - pd.Timedelta(days=lookback_days + delay_days)).strftime("%Y-%m-%d")
+        to_date = end_date or (pd.Timestamp.today().normalize() - pd.Timedelta(days=delay_days)).strftime("%Y-%m-%d")
+    else:
+        to_date = (pd.Timestamp.today().normalize() - pd.Timedelta(days=delay_days)).strftime("%Y-%m-%d")
+        from_date = (pd.Timestamp.today() - pd.Timedelta(days=lookback_days + delay_days)).strftime("%Y-%m-%d")
+    debug(f"fetch range: from={from_date}, to={to_date}")
 
-            # 価格列の推定
-            price_col = None
-            for col in ("Close", "EndPrice", "ClosePrice", "close", "endPrice"):
-                if col in df.columns:
-                    price_col = col
-                    break
-            if not price_col:
-                continue
+    # API 呼び出し
+    url = f"{API_URL}/v1/prices/daily_quotes"
+    params = {"code": code, "from": from_date, "to": to_date}
+    try:
+        res = requests.get(url, headers=headers, params=params, timeout=30)
+        if res.status_code != 200:
+            return pd.DataFrame()
+        data = res.json()
+    except Exception:
+        return pd.DataFrame()
 
-            # 日付列の推定
-            date_col = None
-            for col in ("Date", "date", "BaseDate"):
-                if col in df.columns:
-                    date_col = col
-                    break
+    quotes = data.get("daily_quotes") or data.get("data") or []
+    if not quotes:
+        return pd.DataFrame()
 
-            if date_col:
-                df = df.sort_values(by=date_col)
+    # 整形
+    df = pd.DataFrame(quotes)
+    # 必須カラムの存在チェック
+    required = ["Date", "Open", "High", "Low", "Close", "Volume"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        return pd.DataFrame()
 
-            # 直近期間に絞る
-            df = df.tail(lookback_days)
+    df["Date"] = pd.to_datetime(df["Date"])
+    df = df.sort_values("Date").reset_index(drop=True)
 
-            prices = pd.to_numeric(df[price_col], errors="coerce").dropna()
-            if prices.empty:
-                continue
+    # 列名整形と選択
+    df = df.rename(columns={
+        "Date": "date",
+        "Open": "open",
+        "High": "high",
+        "Low": "low",
+        "Close": "close",
+        "Volume": "volume"
+    })[["date", "open", "high", "low", "close", "volume"]]
 
-            # 最大ドローダウン計算
-            roll_max = prices.cummax()
-            drawdown_series = prices / roll_max - 1.0
-            mdd = drawdown_series.min()  # 負値
-            mdd_abs = abs(mdd)
+    # 簡単な指標（任意）
+    df["ma20"] = df["close"].rolling(20).mean()
+    df["ma60"] = df["close"].rolling(60).mean()
 
-            if mdd_abs >= threshold:
-                results.append((code, mdd_abs))
-        except Exception:
-            continue
+    # プロットして画像を保存
+    try:
+        import matplotlib.pyplot as plt
 
-    results.sort(key=lambda x: x[1], reverse=True)
-    return [code for code, _ in results[:top_n]]
+        fig, ax_price = plt.subplots(figsize=(10, 6))
+        ax_price.plot(df["date"], df["close"], label="Close", color="tab:blue", linewidth=1.5)
+        ax_price.plot(df["date"], df["ma20"], label="MA20", color="tab:orange", linewidth=1.2)
+        ax_price.plot(df["date"], df["ma60"], label="MA60", color="tab:green", linewidth=1.2)
+        ax_price.set_title(f"{code} Price Chart")
+        ax_price.set_xlabel("Date")
+        ax_price.set_ylabel("Price")
+        ax_price.grid(True, alpha=0.3)
+        ax_price.legend(loc="upper left")
 
+        ax_vol = ax_price.twinx()
+        ax_vol.bar(df["date"], df["volume"], label="Volume", color="lightgray", alpha=0.6, width=2)
+        ax_vol.set_ylabel("Volume")
+        ax_vol.legend(loc="upper right")
 
-def get_all_tickers(headers) -> pd.DataFrame:
-    """
-    listed/info を使って全企業の情報を取得する。
-    """
-    endpoint = f"{API_URL}/v1/listed/info"
-    resp = requests.get(endpoint, headers=headers, timeout=30)
-    resp.raise_for_status()
-    payload = resp.json()
-    infos = payload.get("info")
-    tickers = [info["Code"] for info in infos]
-    return tickers
+        out_img = output_dir / f"{code}_{company_name}.png"
+        fig.autofmt_xdate()
+        plt.tight_layout()
+        fig.savefig(out_img, dpi=150)
+        plt.close(fig)
+    except Exception:
+        pass
+    return df
 
 
 def main():
-    pd.set_option("display.max_columns", None)
-
     # config.yaml から refreshtoken を取得
     cfg_path = Path(__file__).with_name("config.yaml")
     if not cfg_path.exists():
         print(f"config.yaml not found at: {cfg_path}")
         sys.exit(1)
-
     try:
         with cfg_path.open("r", encoding="utf-8") as f:
             cfg = yaml.safe_load(f) or {}
@@ -116,23 +130,65 @@ def main():
         print("Refresh token not found in config.yaml or environment.")
         sys.exit(1)
     # idToken取得
-    res = requests.post(f"{API_URL}/v1/token/auth_refresh?refreshtoken={refreshtoken}")
+    res = requests.post(f"{API_URL}/v1/token/auth_refresh?refreshtoken={refreshtoken}", timeout=30)
     if res.status_code == 200:
-        id_token = res.json()['idToken']
-        headers = {'Authorization': 'Bearer {}'.format(id_token)}
+        id_token = res.json().get('idToken')
+        headers = {'Authorization': f'Bearer {id_token}'}
         display("idTokenの取得に成功しました。")
+        debug("idToken fetched successfully.")
     else:
-        display(res.json()["message"])
+        msg = res.json().get("message", f"HTTP {res.status_code}")
+        display(msg)
+        print("Failed to fetch idToken.")
+        sys.exit(1)
 
-    # 全企業情報のティッカー取得
-    all_tickers = get_all_tickers(headers)
+    # cfg から lookback_days を取得し、既定の取得期間を差し替える
+    lb = int(cfg.get("lookback_days", 180))
+    delay_days = 12 * 7
+    start_date = (pd.Timestamp.today() - pd.Timedelta(days=lb + delay_days)).strftime("%Y-%m-%d")
+    end_date = (pd.Timestamp.today().normalize() - pd.Timedelta(days=delay_days)).strftime("%Y-%m-%d")
 
-    # 検索フィルタ（ロジックで関数を入れ替える）
-    filtered_tickers = search_drawdown(headers, all_tickers)
+    # tikers.txt からティッカーコードを読み込み（1 行 1 コード、# で始まる行はコメント扱い）
+    tickers_path = Path(__file__).with_name("search_result.txt")
+    company_names = {}
 
-    with open("tickers.txt", "w", encoding="utf-8") as f:
-        f.write("\n".join(map(str, filtered_tickers)))
-    display(f"Wrote {len(filtered_tickers)} tickers to tickers.txt")
+    if tickers_path.exists():
+        try:
+            with tickers_path.open("r", encoding="utf-8-sig") as f:
+                for line in f:
+                    s = line.strip()
+                    if not s or s.startswith("#"):
+                        continue
+                    parts = [p.strip() for p in re.split(r"[,\t]", s) if p.strip()]
+                    code = parts[0] if parts else ""
+                    name = parts[1] if len(parts) > 1 else ""
+                    if code:
+                        company_names[code] = name
+            debug(f"Loaded {len(company_names)} tickers from search_result.txt")
+        except Exception as e:
+            debug(f"Failed to read tickers: {e}")
+            company_names = {}
+    else:
+        debug("search_result.txt not found; no tickers loaded.")
+
+    # チャートデータの保存先ディレクトリを作成
+    output_dir = Path(__file__).with_name("charts")
+    output_dir.mkdir(exist_ok=True)
+
+    # ティッカーごとにチャート作成
+    results = {}
+    for code, company_name in company_names.items():
+        try:
+            df = make_chart(headers, code, company_name, start_date, end_date,output_dir)
+            if not df.empty:
+                results[code] = df
+                print(f"Processed: {code} {company_name}")
+            else:
+                print(f"No data: {code} {company_name}")
+        except Exception as e:
+            debug(f"Processing failed for {code} {company_name}: {e}")
+            print(f"Failed: {code} {company_name} - {e}")
+
 
 if __name__ == "__main__":
     main()
